@@ -1,0 +1,8 @@
+# dependency tes (dipasang ulang dengan: npm install --no-save luaparse fengari)
+node_modules/
+package.json
+package-lock.json
+
+# artefak yang di-generate saat tes
+tests/_af_patched.lua
+*.log
