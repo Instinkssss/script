@@ -156,6 +156,8 @@ local blocks = {}
 for i = 1, 10 do
   local b = inst("Part", "Block" .. i)
   b.Position = __v3({X=i*2, Y=0, Z=0})
+  b.Size = __v3({X=4, Y=4, Z=4})
+  b.Anchored = true
   b._isBlock = true
   b.Magnitude = 0
   b.Parent = blocksFolder
@@ -182,6 +184,8 @@ lp.Idled = { Connect = function() return {Disconnect=function() end} end }
 local players = inst("Players", "Players")
 players.LocalPlayer = lp
 players._children = { lp }
+function players:GetPlayers() return self._children end
+function players:GetChildren() return self._children end
 
 io.write("MARK: before services", string.char(10))
 -- ============ services ============
@@ -220,11 +224,13 @@ Enum = {
   Font = setmetatable({}, {__index=function() return "Font" end}),
   TextXAlignment = setmetatable({}, {__index=function() return "TX" end}),
   TextTruncate = setmetatable({}, {__index=function() return "TT" end}),
+  TextYAlignment = setmetatable({}, {__index=function() return "TY" end}),
   ApplyStrokeMode = setmetatable({}, {__index=function() return "AS" end}),
   SortOrder = setmetatable({}, {__index=function() return "SO" end}),
   ZIndexBehavior = setmetatable({}, {__index=function() return "ZI" end}),
   UserInputType = setmetatable({}, {__index=function() return "UIT" end}),
   UserInputState = setmetatable({}, {__index=function() return "UIS" end}),
+  AutomaticSize = { None="None", X="X", Y="Y", XY="XY" },
 }
 Instance = { new = function(cls) return inst(cls, cls) end }
 
