@@ -37,7 +37,7 @@
 
 local CONFIG = {
     -- Jarak maksimal block yang mau di-farm (stud)
-    MAX_DISTANCE       = 60,
+    MAX_DISTANCE       = 300,
     -- Jeda antar aksi (detik). Naikkan kalau kena kick anti-cheat.
     ACTION_DELAY       = 0.35,
     -- Berapa lama tunggu item muncul di inventory sebelum dianggap gagal
@@ -987,6 +987,51 @@ local API = {}
 
 function API.start()
     if STATE.running then return end
+
+    -- Diagnosa cepat SEBELUM loop jalan. Kalau START kelihatan "tidak terjadi
+    -- apa-apa", penyebabnya hampir selalu salah satu dari ini, dan sekarang
+    -- alasannya muncul di log UI.
+    local char = LP.Character
+    if not char then
+        STATE.diagnosa = "Karakter belum spawn - tunggu sampai masuk game"
+        log(STATE.diagnosa)
+        return
+    end
+    if not char:FindFirstChild("HumanoidRootPart") then
+        STATE.diagnosa = "HumanoidRootPart tidak ada - karakter belum siap"
+        log(STATE.diagnosa)
+        return
+    end
+
+    local jumlahKandidat = 0
+    for _, container in ipairs(getContainers()) do
+        for _, obj in ipairs(container:GetDescendants()) do
+            if looksLikeBlock(obj) then jumlahKandidat = jumlahKandidat + 1 end
+        end
+    end
+
+    if jumlahKandidat == 0 then
+        STATE.diagnosa = "Tidak ada block terdeteksi - coba tekan SCAN lalu lihat panel hasil"
+        log(STATE.diagnosa)
+        return
+    end
+
+    local dekat, jarak = findNearestBlock()
+    if not dekat then
+        STATE.diagnosa = ("Ada %d block tapi semuanya di luar %d stud - naikkan MAX_DISTANCE")
+            :format(jumlahKandidat, CONFIG.MAX_DISTANCE)
+        log(STATE.diagnosa)
+        return
+    end
+
+    local remote = resolveRemote("break")
+    -- Simpan di STATE.diagnosa supaya TIDAK tertimpa log loop yang berjalan
+    -- cepat. Pesan ini yang dibaca UI untuk menjelaskan apa yang terjadi.
+    STATE.diagnosa = ("%d block, target %s (%.0f stud), remote: %s")
+        :format(jumlahKandidat, dekat.Name, jarak or 0,
+                remote and remote.Name or "TIDAK ADA - pakai tool/click")
+    log(STATE.diagnosa)
+
     STATE.running = true
     STATE.idleStrikes = 0
     STATE.thread = task.spawn(farmLoop)
@@ -1254,11 +1299,15 @@ function UI.build(API)
     STATE.gui = screen
 
     --================ PANEL UTAMA ================
+    -- Ukuran default sengaja kecil supaya tidak memenuhi layar HP.
+    -- Bisa diperbesar/diperkecil lewat grip di sudut kanan bawah,
+    -- dan isinya bisa di-scroll kalau tidak muat.
     local main = new("Frame", {
-        Size = UDim2.new(0, 340, 0, 700),
-        Position = UDim2.new(0, 20, 0.5, -235),
+        Size = UDim2.new(0, 260, 0, 340),
+        Position = UDim2.new(0, 12, 0.5, -170),
         BackgroundColor3 = C.bg,
         BorderSizePixel = 0,
+        ClipsDescendants = true,
         Parent = screen,
     }, { corner(12), stroke(C.stroke, 1) })
 
@@ -1315,11 +1364,82 @@ function UI.build(API)
 
     dragify(main, header)
 
+    --================ GRIP RESIZE (sudut kanan bawah) ================
+    -- Tarik untuk mengubah ukuran panel. Ada tombol kecil untuk reset ukuran.
+    local MIN_W, MIN_H = 200, 200
+    local MAX_W, MAX_H = 900, 1200
+
+    local grip = new("TextButton", {
+        Text = "◢", Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = C.accentDim, BackgroundColor3 = C.panel2,
+        BorderSizePixel = 0,
+        Size = UDim2.new(0, 22, 0, 22),
+        Position = UDim2.new(1, -26, 1, -26),
+        AutoButtonColor = false,
+        ZIndex = 5,
+        Parent = main,
+    }, { corner(4) })
+
+    do
+        local resizing, startPos, startSize = false, nil, nil
+        grip.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+                resizing = true
+                startPos = input.Position
+                startSize = main.AbsoluteSize
+                input.Changed:Connect(function()
+                    if input.UserInputState == Enum.UserInputState.End then
+                        resizing = false
+                    end
+                end)
+            end
+        end)
+        grip.InputChanged:Connect(function(input)
+            if not resizing then return end
+            if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            local d = input.Position - startPos
+            local w = math.clamp(startSize.X + d.X, MIN_W, MAX_W)
+            local h = math.clamp(startSize.Y + d.Y, MIN_H, MAX_H)
+            main.Size = UDim2.new(0, w, 0, h)
+        end)
+    end
+
+    --================ TOMBOL UKURAN (kecil / sedang / besar) ================
+    local sizeBtn = new("TextButton", {
+        Text = "⤢", Font = Enum.Font.GothamBold, TextSize = 13,
+        TextColor3 = C.textDim, BackgroundColor3 = C.panel2,
+        BorderSizePixel = 0,
+        Size = UDim2.new(0, 26, 0, 26),
+        Position = UDim2.new(1, -68, 0, 14),
+        AutoButtonColor = true, Parent = header,
+    }, { corner(7) })
+
+    local SIZES = {
+        { 260, 340 },   -- kecil
+        { 340, 440 },   -- sedang
+        { 420, 560 },   -- besar
+    }
+    local sizeStep = 1
+    sizeBtn.MouseButton1Click:Connect(function()
+        sizeStep = sizeStep + 1
+        if sizeStep > #SIZES then sizeStep = 1 end
+        local s = SIZES[sizeStep]
+        main.Size = UDim2.new(0, s[1], 0, s[2])
+    end)
+
     --================ DAFTAR FITUR ================
-    local list = new("Frame", {
-        Size = UDim2.new(1, -20, 0, 356),
-        Position = UDim2.new(0, 10, 0, 72),
+    -- Daftar fitur bisa di-scroll, jadi tetap bisa dipakai walau panel dikecilkan.
+    local list = new("ScrollingFrame", {
+        Size = UDim2.new(1, -20, 1, -110),
+        Position = UDim2.new(0, 10, 0, 62),
         BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = C.accentDim,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
         Parent = main,
     })
     local listLayout = new("UIListLayout", {
@@ -1452,7 +1572,7 @@ function UI.build(API)
     --================ STATISTIK ================
     local statsBar = new("Frame", {
         Size = UDim2.new(1, -20, 0, 34),
-        Position = UDim2.new(0, 10, 0, 436),
+        Position = UDim2.new(0, 10, 1, -102),
         BackgroundColor3 = C.panel, BorderSizePixel = 0,
         Parent = main,
     }, { corner(8), stroke(C.stroke, 1) })
@@ -1472,36 +1592,42 @@ function UI.build(API)
         Text = "Auto DF: Dihentikan.",
         Font = Enum.Font.Gotham, TextSize = 11,
         TextColor3 = C.textDim, BackgroundTransparency = 1,
-        Size = UDim2.new(1, -20, 0, 20),
-        Position = UDim2.new(0, 10, 0, 482),
+        Size = UDim2.new(1, -20, 0, 26),
+        Position = UDim2.new(0, 10, 1, -68),
         TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
         Parent = main,
     })
 
     --================ LOG ================
     local logFrame = new("Frame", {
-        Size = UDim2.new(1, -20, 0, 24),
-        Position = UDim2.new(0, 10, 0, 504),
+        Size = UDim2.new(1, -20, 0, 42),
+        Position = UDim2.new(0, 10, 1, -56),
         BackgroundColor3 = C.panel, BorderSizePixel = 0,
         ClipsDescendants = true,
         Parent = main,
     }, { corner(6) })
 
+    -- Log multi-baris: 4 baris terakhir terlihat sekaligus, supaya kelihatan
+    -- apa yang sedang dilakukan loop (bukan cuma satu pesan yang tertimpa).
     local logText = new("TextLabel", {
         Text = "siap.",
-        Font = Enum.Font.Code, TextSize = 10,
+        Font = Enum.Font.Code, TextSize = 9,
         TextColor3 = C.textDim, BackgroundTransparency = 1,
-        Size = UDim2.new(1, -12, 1, 0),
-        Position = UDim2.new(0, 6, 0, 0),
+        Size = UDim2.new(1, -12, 1, -6),
+        Position = UDim2.new(0, 6, 0, 4),
         TextXAlignment = Enum.TextXAlignment.Left,
-        TextTruncate = Enum.TextTruncate.AtEnd,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
         Parent = logFrame,
     })
+    STATE.logLines = {}
 
     --================ PANEL HASIL SCOUT ================
     local scoutPanel = new("ScrollingFrame", {
-        Size = UDim2.new(1, -20, 0, 150),
-        Position = UDim2.new(0, 10, 0, 534),
+        Size = UDim2.new(1, -20, 0, 140),
+        Position = UDim2.new(0, 10, 1, -200),
         BackgroundColor3 = C.panel, BorderSizePixel = 0,
         Visible = false, Parent = main,
         ScrollBarThickness = 3,
@@ -1537,12 +1663,19 @@ function UI.build(API)
     -- LOGIKA
     --=====================================================================
     -- pushLog: tulis ke label UI + teruskan ke callback eksternal kalau ada
+    -- Log multi-baris: simpan 4 pesan terakhir supaya kelihatan urutan kejadian.
+    local LOG_MAX = 4
     local function pushLog(msg)
-        logText.Text = tostring(msg)
+        local line = tostring(msg)
+        table.insert(STATE.logLines, 1, line)
+        while #STATE.logLines > LOG_MAX do
+            table.remove(STATE.logLines)
+        end
+        logText.Text = table.concat(STATE.logLines, "\n")
         -- externalLog dipasang oleh AutoFarm.lua kalau perlu; TIDAK boleh
         -- menunjuk ke pushLog sendiri (itu bikin rekursi tak terbatas).
         if STATE.externalLog then
-            pcall(STATE.externalLog, tostring(msg))
+            pcall(STATE.externalLog, line)
         end
     end
     STATE.log = pushLog
@@ -1565,6 +1698,11 @@ function UI.build(API)
             farmBtn.BackgroundColor3 = C.accent
             footer.Text = "Auto DF: Dihentikan."
             footer.TextColor3 = C.textDim
+            -- Tampilkan alasan terakhir supaya START yang "tidak terjadi apa-apa"
+            -- bisa langsung dilihat penyebabnya.
+            if s.diagnosa and s.diagnosa ~= "" then
+                footer.Text = "Dihentikan - " .. tostring(s.diagnosa)
+            end
         end
     end
     STATE.refresh = refresh

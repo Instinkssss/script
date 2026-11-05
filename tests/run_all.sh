@@ -22,3 +22,6 @@ node run_modes.js 2>&1 | grep -E "^(PASS|FAIL|ALL)"
 echo
 echo "=== 7. ALL-IN-ONE (Scout + Farm + UI jadi satu file) ==="
 node run_allinone.js 2>&1 | grep -E "^(PASS|FAIL|ALL)"
+echo
+echo "=== 8. TOMBOL START (diagnostik + loop jalan) ==="
+node run_start.js 2>&1 | grep -E "^(PASS|FAIL|ALL)"
