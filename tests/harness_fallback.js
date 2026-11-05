@@ -15,13 +15,13 @@ if(lauxlib.luaL_dostring(L,to_luastring(pre))!==lua.LUA_OK){console.error('PRELU
 
 let src=fs.readFileSync(path.join(__dirname,'..','AutoFarm.lua'),'utf8');
 src=src.replace(/local uiOk, UI = pcall\(function\(\)[\s\S]*?end\)\n/,'local uiOk, UI = false, nil\n');
-src=src.replace(/getgenv\(\)\.GrowbloxAutoFarm = API/,'G = API');
 src=src.replace(/AUTO_START\s*=\s*false/,'AUTO_START = true');
 src=src.replace(/ACTION_DELAY\s*=\s*0\.35/,'ACTION_DELAY = 0');
 src=src.replace(/COLLECT_TIMEOUT\s*=\s*3/,'COLLECT_TIMEOUT = 0.2');
 if(lauxlib.luaL_dostring(L,to_luastring(src))!==lua.LUA_OK){console.error('AUTOFARM:',lua.lua_tojsstring(L,-1));process.exit(1);}
 
 const drive=`
+local G = __GENV.GrowbloxAutoFarm
 G.start()
 local guard=0
 local co = __ITER.co

@@ -53,6 +53,7 @@ local function mkclass()
       if type(a) == "table" and a._isBlock and a.Parent then
         local p = a.Parent
         for i,c in ipairs(p._children) do if c == a then table.remove(p._children, i) break end end
+        a.Parent = nil
         local inv = _G.__INV
         if inv then
           local neo = setmetatable({ClassName="Tool", Name="Item"..(#inv._children+1), _children={}, Transparency=0, Material="Grass", Position={X=0,Y=0,Z=0}, _attrs={}}, CLASS)
@@ -69,7 +70,31 @@ local function mkclass()
   function C:ClickButton2() end
   function C:SendMouseButtonEvent() end
   function C:WorldToViewportPoint() return {X=100, Y=100, Z=1} end
-  function C:Activate() TRACE.breakCalls = TRACE.breakCalls + 1 end
+  function C:Activate()
+    TRACE.breakCalls = TRACE.breakCalls + 1
+    -- Simulasi tool yang benar-benar menghancurkan block terdekat.
+    -- Tanpa ini, jalur fallback tidak akan pernah bisa lolos verifikasi.
+    if _G.__BLOCKS then
+      for _, b in ipairs(_G.__BLOCKS) do
+        if b._isBlock and b.Parent then
+          local p = b.Parent
+          for i, c in ipairs(p._children) do
+            if c == b then table.remove(p._children, i) break end
+          end
+          b.Parent = nil
+          local inv = _G.__INV
+          if inv then
+            local neo = setmetatable({ClassName="Tool", Name="Item"..(#inv._children+1),
+              _children={}, Transparency=0, Material="Grass",
+              Position={X=0,Y=0,Z=0}, _attrs={}}, CLASS)
+            table.insert(inv._children, neo)
+            TRACE.collectEvents = TRACE.collectEvents + 1
+          end
+          break
+        end
+      end
+    end
+  end
   function C:Connect(fn) return { Disconnect = function() end } end
   return C
 end
@@ -212,7 +237,7 @@ CFrame = { new = function(p) return {Position=p} end }
 -- task / os helpers
 -- task.wait TIDAK no-op: kalau no-op, loop jadi busy-loop tanpa batas.
 -- Simulasi: setiap wait memajukan "waktu" dan membatasi iterasi agar tes pasti selesai.
-local ITER = { n = 0, max = 60 }
+local ITER = { n = 0, max = 400 }
 task = {
   spawn = function(f)
     -- kumpulkan coroutine supaya dipanggil bertahap dari DRIVE
@@ -238,7 +263,8 @@ warn = function(...) local s="" for i=1,select("#",...) do s=s..tostring((select
 print = function(...) local s="" for i=1,select("#",...) do s=s..tostring((select(i,...))).." " end io.write(s .. [[
 
 ]]) end
-getgenv = function() return {} end
+__GENV = {}
+getgenv = function() return __GENV end
 loadstring = function() return function() return nil end end
 RESULT = TRACE
 _G.__BLOCKS = blocks
@@ -261,8 +287,7 @@ Instance.new = function(cls) __instCount = __instCount + 1 return __realInstance
 __uiInstanceCount = function() return __instCount end
 local Players          = game:GetService("Players")`
 );
-// matikan expose getgenv
-src = src.replace(/getgenv\(\)\.GrowbloxAutoFarm = API/, 'G = API');
+// biarkan skrip menetapkan API ke getgenv() sendiri (getgenv sudah diarahkan ke __GENV)
 // paksa auto start untuk uji loop
 src = src.replace(/AUTO_START\s*=\s*false/, 'AUTO_START = true');
 // jeda dibuat nol supaya tes cepat
@@ -273,7 +298,7 @@ fs.writeFileSync(path.join(__dirname, '_af_patched.lua'), src);
 
 // helper: tunggu sampai loop berhenti (STATE.running false)
 const DRIVE = `
-G = G or getgenv().GrowbloxAutoFarm
+local G = __GENV.GrowbloxAutoFarm
 -- jalankan loop sampai selesai; task.wait no-op jadi while langsung tuntas
 G.start()
 local guard = 0

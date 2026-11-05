@@ -44,6 +44,15 @@ local CONFIG = {
     ACCEPT_ANY_PART_IN_CONTAINER = true,
     -- Berhenti otomatis kalau tidak ada block terdeteksi N kali berturut-turut
     IDLE_STRIKES_MAX   = 5,
+    -- Berapa kali satu block boleh gagal dihancurkan sebelum dilewati.
+    MAX_BLOCK_FAILS    = 3,
+
+    -- Parameter mode sapuan (adaptasi dari break3way/place3way di script DF)
+    THREE_WAY_RADIUS   = 8,    -- radius cluster saat mode "Break 3 Arah" aktif
+    THREE_WAY_LIMIT    = 12,   -- maksimum block per cluster (jaga agar tidak spam)
+    SWEEP_LENGTH       = 6,    -- berapa block yang disapu ke satu arah
+    TRASH_THRESHOLD    = 25,   -- buang item sampah kalau isi inventory >= ini
+    JUNK_KEYWORDS      = { "dirt", "soil", "rock", "stone", "grass", "leaf", "leaves" },
 
     -- Nama RemoteEvent / RemoteFunction.
     -- KOSONGKAN kalau tidak tahu -> script akan coba auto-detect.
@@ -54,6 +63,8 @@ local CONFIG = {
         ["break"] = nil,   -- remote untuk menghancurkan block
         collect   = nil,   -- remote untuk ambil item (kalau ada)
         hit       = nil,   -- remote damage berulang (kalau break butuh multi-hit)
+        place     = nil,   -- remote untuk menanam / menaruh block
+        trash     = nil,   -- remote untuk membuang item sampah
     },
 
     -- Cara mendeteksi block.
@@ -95,6 +106,9 @@ local STATE = {
     ui           = nil,
     conns        = {},
     thread       = nil,
+    -- mode yang dikendalikan UI (adaptasi dari script DF)
+    modes        = {},
+    autoCollect  = true,
 }
 
 -- lower-case helper
@@ -165,15 +179,21 @@ local function findNearestBlock()
     if not root then return nil end
     local origin = root.Position
 
+    STATE.failed = STATE.failed or {}
     local best, bestDist = nil, CONFIG.MAX_DISTANCE
     for _, container in ipairs(getContainers()) do
         for _, obj in ipairs(container:GetDescendants()) do
             if looksLikeBlock(obj) and obj.Transparency < 1 then
-                local ok, pos = pcall(function() return obj.Position end)
-                if ok and pos then
-                    local d = (pos - origin).Magnitude
-                    if d < bestDist then
-                        best, bestDist = obj, d
+                -- lewati block yang sudah beberapa kali gagal dihancurkan,
+                -- supaya loop tidak terjebak memilih target yang sama
+                local fails = STATE.failed[obj]
+                if not fails or fails < CONFIG.MAX_BLOCK_FAILS then
+                    local ok, pos = pcall(function() return obj.Position end)
+                    if ok and pos then
+                        local d = (pos - origin).Magnitude
+                        if d < bestDist then
+                            best, bestDist = obj, d
+                        end
                     end
                 end
             end
@@ -198,6 +218,8 @@ local function resolveRemote(kind)
         ["break"] = { "break", "destroy", "dig", "mine", "harvest", "punch", "hitblock" },
         collect   = { "collect", "pickup", "grab", "takeitem", "claim" },
         hit       = { "hit", "damage", "attack", "swing" },
+        place     = { "place", "plant", "build", "setblock", "putblock" },
+        trash     = { "trash", "drop", "discard", "deleteitem", "removeitem" },
     }
     local words = patterns[kind] or {}
 
@@ -213,6 +235,60 @@ local function resolveRemote(kind)
     end
     return nil
 end
+
+--=====================================================================
+-- [3.5] HELPER UMUM (dipakai mode sapuan / plant / trash)
+--=====================================================================
+
+-- Posisi sebuah objek (Part atau Model). Model diambil dari PrimaryPart
+-- atau anak pertamanya yang Part-like.
+local function getPos(obj)
+    if not obj then return nil end
+    local ok, p = pcall(function() return obj.Position end)
+    if ok and p then return p end
+    if obj:IsA("Model") then
+        local base = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+        if base then
+            local ok2, p2 = pcall(function() return base.Position end)
+            if ok2 then return p2 end
+        end
+    end
+    return nil
+end
+
+-- Block dianggap "mati" kalau sudah dihancurkan / tidak lagi di workspace
+local function isDead(obj)
+    if not obj or not obj.Parent then return true end
+    local ok, tr = pcall(function() return obj.Transparency end)
+    if ok and tr and tr >= 1 then return true end
+    return false
+end
+
+-- Kandidat block saat ini (semua container di-scan sekali)
+local function getBlockCandidates()
+    local out = {}
+    for _, container in ipairs(getContainers()) do
+        for _, obj in ipairs(container:GetDescendants()) do
+            if looksLikeBlock(obj) then table.insert(out, obj) end
+        end
+    end
+    return out
+end
+
+-- Tool di tangan (kalau ada)
+local function getTool()
+    local char = LP.Character
+    if not char then return nil end
+    return char:FindFirstChildOfClass("Tool")
+end
+
+-- Backpack player
+local function getBackpack()
+    return LP:FindFirstChildOfClass("Backpack")
+end
+
+-- Apakah executor punya VirtualInputManager (untuk fallback klik)
+local fireToolActivation = (type(VirtualInputManager) == "table")
 
 --=====================================================================
 -- [4] AKSI INTI
@@ -232,7 +308,18 @@ local function moveToBlock(block)
 end
 
 -- Break satu block. Coba remote dulu, lalu fallback ke tool/click.
+-- PENTING: return true hanya kalau ada bukti block benar-benar hancur.
+-- Tanpa verifikasi ini, loop akan menganggap block mati padahal masih hidup,
+-- lalu memilih block yang sama terus-menerus (macet).
 local function breakBlock(block)
+    if not block or isDead(block) then return false, "sudah-hancur" end
+
+    local function verifier()
+        -- beri 1 frame supaya penghapusan dari server terpropagasi
+        task.wait(0.05)
+        return isDead(block) or not block.Parent
+    end
+
     -- 1) lewat RemoteEvent
     local remote = resolveRemote("break")
     if remote then
@@ -250,7 +337,7 @@ local function breakBlock(block)
                     remote:InvokeServer(table.unpack(args))
                 end
             end)
-            if ok then return true, "remote:" .. remote.Name end
+            if ok and verifier() then return true, "remote:" .. remote.Name end
         end
     end
 
@@ -259,7 +346,7 @@ local function breakBlock(block)
     local tool = char and char:FindFirstChildOfClass("Tool")
     if tool then
         pcall(function() tool:Activate() end)
-        return true, "tool:" .. tool.Name
+        if verifier() then return true, "tool:" .. tool.Name end
     end
 
     -- 3) fallback terakhir: klik di posisi block
@@ -274,11 +361,11 @@ local function breakBlock(block)
                 task.wait(0.05)
                 VirtualInputManager:SendMouseButtonEvent(screenPos.X, screenPos.Y, 0, false, game, 1)
             end)
-            return true, "click"
+            if verifier() then return true, "click" end
         end
     end
 
-    return false, "no-remote-no-tool"
+    return false, "block-tidak-hancur"
 end
 
 -- Hitung isi inventory (Backpack + semua container di Character + PlayerGui yang mungkin)
@@ -320,6 +407,136 @@ local function log(msg)
     end
 end
 
+-- Baca mode yang di-toggle di UI. Default mati, kecuali yang di-set lain.
+local function mode(key)
+    return STATE.modes and STATE.modes[key] == true
+end
+
+-- Kumpulkan block lain di sekitar target dalam radius tertentu.
+-- Adaptasi dari break3way() di script DF: satu titik, hancurkan sekitarnya.
+local function findClusterAround(center, radius)
+    local result = {}
+    local origin = getPos(center)
+    if not origin then return result end
+    for _, obj in ipairs(getBlockCandidates()) do
+        if obj ~= center and isPartLike(obj) and not isDead(obj) then
+            local p = getPos(obj)
+            if p then
+                local d = (p - origin).Magnitude
+                if d <= radius then
+                    table.insert(result, obj)
+                    if #result >= CONFIG.THREE_WAY_LIMIT then break end
+                end
+            end
+        end
+    end
+    return result
+end
+
+-- Block di satu sisi saja (kiri = -1, kanan = +1) pada sumbu X.
+-- Adaptasi dari sapuan arah di script DF.
+local function findSideBlocks(center, side, length)
+    local result = {}
+    local origin = getPos(center)
+    if not origin then return result end
+    local found = {}
+    for _, obj in ipairs(getBlockCandidates()) do
+        if obj ~= center and isPartLike(obj) and not isDead(obj) then
+            local p = getPos(obj)
+            if p then
+                local dx = p.X - origin.X
+                local dz = p.Z - origin.Z
+                -- hanya ambil yang benar-benar di sisi itu dan tidak terlalu jauh
+                if (side < 0 and dx < -0.5) or (side > 0 and dx > 0.5) then
+                    if math.abs(dz) <= length and math.abs(dx) <= length * 2 then
+                        table.insert(found, { obj = obj, d = math.abs(dx) })
+                    end
+                end
+            end
+        end
+    end
+    table.sort(found, function(a, b) return a.d < b.d end)
+    for i = 1, math.min(length, #found) do
+        table.insert(result, found[i].obj)
+    end
+    return result
+end
+
+-- Tanam ulang di posisi block yang baru dihancurkan.
+-- Adaptasi dari place3way()/plantDirt(). Pakai tool kalau ada, kalau tidak
+-- coba remote "place" hasil auto-detect.
+local function tryPlantAt(block)
+    if not block or isDead(block) then return false end
+    local pos = getPos(block)
+    if not pos then return false end
+    local tool = getTool()
+    if tool and fireToolActivation then
+        local ok = pcall(function() tool:Activate() end)
+        if ok then return true end
+    end
+    if CONFIG.REMOTES.place then
+        local r = resolveRemote(CONFIG.REMOTES.place)
+        if r then
+            pcall(function() r:FireServer(pos) end)
+            return true
+        end
+    end
+    return false
+end
+
+-- Tanam ulang di beberapa titik sekaligus (dipakai saat block sudah habis)
+local function tryPlantArea()
+    local planted = 0
+    for _, obj in ipairs(getBlockCandidates()) do
+        if planted >= CONFIG.SWEEP_LENGTH then break end
+        if isDead(obj) then
+            if tryPlantAt(obj) then planted = planted + 1 end
+        end
+    end
+    if planted > 0 then log(("Tanam ulang %d titik"):format(planted)) end
+    return planted
+end
+
+-- Buang item sampah kalau inventory sudah menumpuk.
+-- Adaptasi dari bot:trash() di script DF.
+local function tryTrashJunk()
+    local backpack = getBackpack()
+    if not backpack then return 0 end
+    local items = {}
+    for _, it in ipairs(backpack:GetChildren()) do
+        table.insert(items, it)
+    end
+    if #items < CONFIG.TRASH_THRESHOLD then return 0 end
+
+    local dumped = 0
+    for _, it in ipairs(items) do
+        if dumped >= math.floor(#items / 2) then break end
+        local n = lc(it.Name)
+        for _, kw in ipairs(CONFIG.JUNK_KEYWORDS) do
+            if string.find(n, kw, 1, true) then
+                -- jalur 1: remote trash hasil auto-detect
+                local done = false
+                if CONFIG.REMOTES.trash then
+                    local r = resolveRemote(CONFIG.REMOTES.trash)
+                    if r then
+                        pcall(function() r:FireServer(it) end)
+                        done = true
+                    end
+                end
+                -- jalur 2: destroy lokal (beberapa game izinkan)
+                if not done then
+                    pcall(function() it:Destroy() end)
+                    done = true
+                end
+                if done then dumped = dumped + 1 end
+                break
+            end
+        end
+    end
+    if dumped > 0 then log(("Buang %d item sampah"):format(dumped)) end
+    return dumped
+end
+
 local function farmLoop()
     log("Auto farm dimulai")
     STATE.idleStrikes = 0
@@ -332,6 +549,8 @@ local function farmLoop()
             STATE.currentTarget = "-"
             log(("Tidak ada block (%d/%d)"):format(STATE.idleStrikes, CONFIG.IDLE_STRIKES_MAX))
             if STATE.idleStrikes >= CONFIG.IDLE_STRIKES_MAX then
+                if mode("plant") then tryPlantArea() end
+                if mode("autoTrash") then tryTrashJunk() end
                 log("Semua block habis. Auto farm berhenti.")
                 STATE.running = false
                 if STATE.ui then STATE.ui.refresh() end
@@ -347,20 +566,73 @@ local function farmLoop()
             task.wait(CONFIG.ACTION_DELAY)
 
             local before = countInventory()
-            local ok, how = breakBlock(block)
 
-            if ok then
-                STATE.broken = STATE.broken + 1
+            -- Break 3 arah: hancurkan cluster di sekitar target, bukan hanya
+            -- satu block. Ini adaptasi dari break3way() di script DF Growtopia.
+            local hitCount = 0
+            if mode("threeWay") then
+                -- PENTING: target itu sendiri harus ikut, bukan cuma tetangganya.
+                -- findClusterAround mengecualikan `center`, jadi tambahkan manual.
+                local ok0 = breakBlock(block)
+                if ok0 then
+                    hitCount = hitCount + 1
+                    STATE.broken = STATE.broken + 1
+                end
+                task.wait(CONFIG.ACTION_DELAY)
+
+                local cluster = findClusterAround(block, CONFIG.THREE_WAY_RADIUS)
+                for _, b in ipairs(cluster) do
+                    if not STATE.running then break end
+                    if breakBlock(b) then
+                        hitCount = hitCount + 1
+                        STATE.broken = STATE.broken + 1
+                    end
+                    task.wait(CONFIG.ACTION_DELAY)
+                end
             else
-                log("Break gagal: " .. tostring(how))
+                local ok, how = breakBlock(block)
+                if ok then
+                    hitCount = 1
+                    STATE.broken = STATE.broken + 1
+                else
+                    STATE.failed = STATE.failed or {}
+                    STATE.failed[block] = (STATE.failed[block] or 0) + 1
+                    log(("Break gagal (%dx): %s"):format(STATE.failed[block], tostring(how)))
+                end
+            end
+
+            -- Sapuan arah (kiri/kanan): ambil block di sisi yang dipilih saja
+            if mode("sweepLeft") or mode("sweepRight") then
+                local side = mode("sweepLeft") and -1 or 1
+                local sideBlocks = findSideBlocks(block, side, CONFIG.SWEEP_LENGTH)
+                for _, b in ipairs(sideBlocks) do
+                    if not STATE.running then break end
+                    if breakBlock(b) then
+                        hitCount = hitCount + 1
+                        STATE.broken = STATE.broken + 1
+                    end
+                    task.wait(CONFIG.ACTION_DELAY)
+                end
             end
 
             task.wait(CONFIG.ACTION_DELAY)
 
-            local got, amount = waitForCollect(before, CONFIG.COLLECT_TIMEOUT)
-            if got then
-                STATE.collected = STATE.collected + amount
-                log(("Kumpul %d item dari %s"):format(amount, block.Name))
+            if STATE.autoCollect ~= false then
+                local got, amount = waitForCollect(before, CONFIG.COLLECT_TIMEOUT)
+                if got then
+                    STATE.collected = STATE.collected + amount
+                    log(("Kumpul %d item dari %s"):format(amount, block.Name))
+                end
+            end
+
+            -- tanam ulang di posisi yang baru dikosongkan
+            if mode("plant") then
+                tryPlantAt(block)
+            end
+
+            -- buang item sampah kalau inventory mendekati penuh
+            if mode("autoTrash") then
+                tryTrashJunk()
             end
 
             if STATE.ui then STATE.ui.refresh() end
@@ -405,6 +677,32 @@ function API.status()
     return STATE
 end
 
+-- setMode: dipanggil UI saat toggle diubah. Mode dari script DF asli
+-- (sweep kiri/kanan, 3 arah, plant, trash) diadaptasi ke Growblox.
+function API.setMode(key, value)
+    STATE.modes = STATE.modes or {}
+    STATE.modes[key] = value and true or false
+    local label = ({
+        sweepLeft  = "Break Kiri",
+        sweepRight = "Break Kanan",
+        threeWay   = "Break 3 Arah",
+        plant      = "Plant",
+        autoTrash  = "Auto Trash",
+    })[key] or key
+    STATE.lastError = label .. ": " .. (value and "aktif" or "mati")
+    if STATE.ui and STATE.ui.refresh then STATE.ui.refresh() end
+end
+
+-- setAutoCollect: auto ambil item yang jatuh
+function API.setAutoCollect(value)
+    STATE.autoCollect = value and true or false
+    STATE.lastError = "AutoDF: " .. (value and "aktif" or "mati")
+end
+
+function API.getMode(key)
+    return STATE.modes and STATE.modes[key] or false
+end
+
 function API.destroy()
     API.stop()
     for _, c in ipairs(STATE.conns) do pcall(function() c:Disconnect() end) end
@@ -428,63 +726,57 @@ end
 -- [8] LOAD UI + START
 --=====================================================================
 
--- UI di-embed langsung di file ini supaya cukup satu loadstring saja.
+-- UI ter-embed dari FarmUI.lua (gaya JunnzxyHub: hitam + cyan).
+-- Cukup satu loadstring, tidak perlu file terpisah.
 local function buildUI(api)
-    local UI = {}
-    local STATE = {
-    api      = nil,
-    gui      = nil,
-    logs     = {},
-    running  = false,
-    refresh  = nil,
-    log      = nil,
-    destroy  = nil,
+local UI = {}
+local STATE = {
+    api = nil, gui = nil, logs = {},
+    refresh = nil, log = nil, destroy = nil,
 }
 
-    --=====================================================================
--- WARNA
-    --=====================================================================
-    local C = {
-    bg      = Color3.fromRGB(14, 16, 20),
-    panel   = Color3.fromRGB(22, 25, 31),
-    panel2  = Color3.fromRGB(30, 34, 42),
-    accent  = Color3.fromRGB(60, 220, 130),
-    accentD = Color3.fromRGB(35, 150, 90),
-    text    = Color3.fromRGB(235, 238, 242),
-    textDim = Color3.fromRGB(150, 158, 170),
-    danger  = Color3.fromRGB(240, 90, 95),
-    stroke  = Color3.fromRGB(48, 54, 64),
+--=====================================================================
+-- PALET (dari analisa pixel gambar referensi)
+--=====================================================================
+local C = {
+    bg        = Color3.fromRGB(0, 0, 0),        -- #000000 latar
+    panel     = Color3.fromRGB(14, 13, 21),     -- #0e0d15 panel
+    panel2    = Color3.fromRGB(20, 17, 28),     -- #14111c panel terang
+    accent    = Color3.fromRGB(91, 191, 217),   -- #5bbfd9 cyan
+    accentDim = Color3.fromRGB(45, 110, 130),
+    text      = Color3.fromRGB(235, 240, 245),
+    textDim   = Color3.fromRGB(120, 128, 145),
+    off       = Color3.fromRGB(55, 58, 70),
+    danger    = Color3.fromRGB(230, 85, 95),
+    stroke    = Color3.fromRGB(32, 30, 44),
+    white     = Color3.fromRGB(255, 255, 255),
 }
 
-    --=====================================================================
+--=====================================================================
 -- UTIL
-    --=====================================================================
-    local function new(className, props, children)
-    local obj = Instance.new(className)
+--=====================================================================
+local function new(cls, props, children)
+    local o = Instance.new(cls)
     for k, v in pairs(props or {}) do
-        if k ~= "Parent" then obj[k] = v end
+        if k ~= "Parent" then o[k] = v end
     end
-    for _, c in ipairs(children or {}) do
-        c.Parent = obj
-    end
-    if props and props.Parent then obj.Parent = props.Parent end
-    return obj
-    end
+    for _, c in ipairs(children or {}) do c.Parent = o end
+    if props and props.Parent then o.Parent = props.Parent end
+    return o
+end
 
-    local function corner(r)
-    return new("UICorner", { CornerRadius = UDim.new(0, r or 8) })
-    end
+local function corner(r)
+    return new("UICorner", { CornerRadius = UDim.new(0, r or 6) })
+end
 
-    local function stroke(color, thick, trans)
+local function stroke(color, t, tr)
     return new("UIStroke", {
-        Color = color or C.stroke,
-        Thickness = thick or 1,
-        Transparency = trans or 0,
-        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Color = color or C.stroke, Thickness = t or 1,
+        Transparency = tr or 0, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
     })
-    end
+end
 
-    local function dragify(frame, handle)
+local function dragify(frame, handle)
     handle = handle or frame
     local dragging, dragStart, startPos
     handle.InputBegan:Connect(function(input)
@@ -503,25 +795,74 @@ local function buildUI(api)
     handle.InputChanged:Connect(function(input)
         if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
         or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
+            local d = input.Position - dragStart
             frame.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y
-            )
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
         end
     end)
+end
+
+--=====================================================================
+-- TOGGLE SWITCH (gaya iOS, cyan saat aktif)
+--=====================================================================
+local function makeToggle(parent, layoutOrder)
+    local holder = new("TextButton", {
+        Size = UDim2.new(0, 46, 0, 24),
+        BackgroundColor3 = C.off,
+        BorderSizePixel = 0,
+        Text = "",
+        AutoButtonColor = false,
+        LayoutOrder = layoutOrder,
+        Parent = parent,
+    }, { corner(12) })
+
+    local knob = new("Frame", {
+        Size = UDim2.new(0, 18, 0, 18),
+        Position = UDim2.new(0, 3, 0.5, -9),
+        BackgroundColor3 = C.white,
+        BorderSizePixel = 0,
+        Parent = holder,
+    }, { corner(9) })
+
+    local state = { on = false }
+
+    local function render()
+        if state.on then
+            holder.BackgroundColor3 = C.accent
+            knob.Position = UDim2.new(1, -21, 0.5, -9)
+        else
+            holder.BackgroundColor3 = C.off
+            knob.Position = UDim2.new(0, 3, 0.5, -9)
+        end
     end
 
-    --=====================================================================
+    holder.MouseButton1Click:Connect(function()
+        state.on = not state.on
+        render()
+        if state.onChanged then state.onChanged(state.on) end
+    end)
+
+    render()
+    state.set = function(v)
+        state.on = v and true or false
+        render()
+    end
+    state.render = render
+    return state, holder
+end
+
+--=====================================================================
 -- BUILD
-    --=====================================================================
-    function UI.build(API)
+--=====================================================================
+function UI.build(API)
     STATE.api = API
-    local LP = game:GetService("Players").LocalPlayer
+    local Players = game:GetService("Players")
+    local LP = Players.LocalPlayer
     local pg = LP:WaitForChild("PlayerGui")
 
     local screen = new("ScreenGui", {
-        Name = "GrowbloxAutoFarm",
+        Name = "GrowbloxFarmUI",
         ResetOnSpawn = false,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
         IgnoreGuiInset = true,
@@ -529,317 +870,315 @@ local function buildUI(api)
     })
     STATE.gui = screen
 
-        --================ Frame utama ================
+    --================ PANEL UTAMA ================
     local main = new("Frame", {
-        Name = "Main",
-        Size = UDim2.new(0, 340, 0, 396),
-        Position = UDim2.new(0, 24, 0.5, -198),
+        Size = UDim2.new(0, 330, 0, 470),
+        Position = UDim2.new(0, 20, 0.5, -235),
         BackgroundColor3 = C.bg,
         BorderSizePixel = 0,
         Parent = screen,
-    }, { corner(14), stroke(C.stroke, 1) })
+    }, { corner(12), stroke(C.stroke, 1) })
 
-        --================ Header ================
+    --================ HEADER ================
     local header = new("Frame", {
-        Name = "Header",
-        Size = UDim2.new(1, 0, 0, 52),
+        Size = UDim2.new(1, 0, 0, 62),
         BackgroundColor3 = C.panel,
         BorderSizePixel = 0,
         Parent = main,
-    }, { corner(14) })
-
-    -- tutup sudut bawah header biar rata
+    }, { corner(12) })
     new("Frame", {
-        Size = UDim2.new(1, 0, 0, 14),
-        Position = UDim2.new(0, 0, 1, -14),
-        BackgroundColor3 = C.panel,
-        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 16),
+        Position = UDim2.new(0, 0, 1, -16),
+        BackgroundColor3 = C.panel, BorderSizePixel = 0,
         Parent = header,
     })
-
-    new("Frame", {
-        Name = "AccentBar",
-        Size = UDim2.new(0, 4, 0, 26),
-        Position = UDim2.new(0, 16, 0.5, -13),
-        BackgroundColor3 = C.accent,
-        BorderSizePixel = 0,
-        Parent = header,
-    }, { corner(2) })
 
     new("TextLabel", {
-        Name = "Title",
-        Text = "GROWBLOX AUTOFARM",
-        Font = Enum.Font.GothamBold,
-        TextSize = 15,
-        TextColor3 = C.text,
-        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "JunnzxyHub",
+        Font = Enum.Font.GothamBold, TextSize = 17,
+        TextColor3 = C.text, TextXAlignment = Enum.TextXAlignment.Left,
         BackgroundTransparency = 1,
-        Size = UDim2.new(1, -90, 0, 18),
-        Position = UDim2.new(0, 30, 0, 10),
+        Size = UDim2.new(1, -80, 0, 20),
+        Position = UDim2.new(0, 16, 0, 10),
         Parent = header,
     })
-
-    local statusLabel = new("TextLabel", {
-        Name = "Status",
-        Text = "● IDLE",
-        Font = Enum.Font.GothamMedium,
-        TextSize = 12,
-        TextColor3 = C.textDim,
-        TextXAlignment = Enum.TextXAlignment.Left,
+    new("TextLabel", {
+        Text = "v3.0",
+        Font = Enum.Font.GothamBold, TextSize = 11,
+        TextColor3 = C.accent, TextXAlignment = Enum.TextXAlignment.Right,
         BackgroundTransparency = 1,
-        Size = UDim2.new(1, -90, 0, 16),
-        Position = UDim2.new(0, 30, 0, 28),
+        Size = UDim2.new(0, 60, 0, 20),
+        Position = UDim2.new(1, -78, 0, 12),
+        Parent = header,
+    })
+    new("TextLabel", {
+        Text = "Farm Auto DF-Tools",
+        Font = Enum.Font.Gotham, TextSize = 12,
+        TextColor3 = C.textDim, TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, -80, 0, 18),
+        Position = UDim2.new(0, 16, 0, 32),
         Parent = header,
     })
 
     local closeBtn = new("TextButton", {
-        Name = "Close",
-        Text = "×",
-        Font = Enum.Font.GothamBold,
-        TextSize = 20,
-        TextColor3 = C.textDim,
-        BackgroundColor3 = C.panel2,
+        Text = "×", Font = Enum.Font.GothamBold, TextSize = 18,
+        TextColor3 = C.textDim, BackgroundColor3 = C.panel2,
         BorderSizePixel = 0,
-        Size = UDim2.new(0, 28, 0, 28),
-        Position = UDim2.new(1, -40, 0.5, -14),
-        AutoButtonColor = true,
-        Parent = header,
-    }, { corner(8) })
+        Size = UDim2.new(0, 26, 0, 26),
+        Position = UDim2.new(1, -38, 0, 14),
+        AutoButtonColor = true, Parent = header,
+    }, { corner(7) })
 
     dragify(main, header)
 
-        --================ Stats ================
-    local statsFrame = new("Frame", {
-        Name = "Stats",
-        Size = UDim2.new(1, -28, 0, 66),
-        Position = UDim2.new(0, 14, 0, 64),
+    --================ DAFTAR FITUR ================
+    local list = new("Frame", {
+        Size = UDim2.new(1, -20, 0, 296),
+        Position = UDim2.new(0, 10, 0, 72),
         BackgroundTransparency = 1,
         Parent = main,
     })
+    local listLayout = new("UIListLayout", {
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = list,
+    })
 
-    local function makeStat(idx, label, color)
-        local w = 1 / 3
-        local f = new("Frame", {
-            Size = UDim2.new(w, -8, 1, 0),
-            Position = UDim2.new(w * idx, 4 + idx * 0, 0, 0),
+    -- helper: buat satu baris fitur
+    local function makeRow(order, icon, name, desc)
+        local row = new("Frame", {
+            Size = UDim2.new(1, 0, 0, 54),
             BackgroundColor3 = C.panel,
             BorderSizePixel = 0,
-            Parent = statsFrame,
-        }, { corner(10), stroke(C.stroke, 1) })
-        f.Position = UDim2.new(w * idx, 4, 0, 0)
-        f.Size = UDim2.new(w, -6, 1, 0)
-
-        local val = new("TextLabel", {
-            Text = "0",
-            Font = Enum.Font.GothamBold,
-            TextSize = 19,
-            TextColor3 = color,
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 0, 24),
-            Position = UDim2.new(0, 0, 0, 10),
-            Parent = f,
-        })
-        new("TextLabel", {
-            Text = label,
-            Font = Enum.Font.Gotham,
-            TextSize = 10,
-            TextColor3 = C.textDim,
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 0, 14),
-            Position = UDim2.new(0, 0, 0, 36),
-            Parent = f,
-        })
-        return val
-    end
-
-    local brokenVal    = makeStat(0, "BLOCK DIHANCURKAN", C.accent)
-    local collectedVal = makeStat(1, "ITEM TERKUMPUL", Color3.fromRGB(90, 170, 255))
-    local targetVal    = makeStat(2, "TARGET SEKARANG", C.text)
-
-        --================ Info baris ================
-    local infoLabel = new("TextLabel", {
-        Name = "Info",
-        Text = "Menunggu perintah...",
-        Font = Enum.Font.Gotham,
-        TextSize = 11,
-        TextColor3 = C.textDim,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextTruncate = Enum.TextTruncate.AtEnd,
-        BackgroundColor3 = C.panel,
-        BorderSizePixel = 0,
-        Size = UDim2.new(1, -28, 0, 28),
-        Position = UDim2.new(0, 14, 0, 140),
-        TextXAlignment = Enum.TextXAlignment.Center,
-        Parent = main,
-    }, { corner(8) })
-
-        --================ Tombol utama ================
-    local actionBtn = new("TextButton", {
-        Name = "Action",
-        Text = "MULAI AUTO FARM",
-        Font = Enum.Font.GothamBold,
-        TextSize = 14,
-        TextColor3 = Color3.fromRGB(10, 14, 12),
-        BackgroundColor3 = C.accent,
-        BorderSizePixel = 0,
-        Size = UDim2.new(1, -28, 0, 42),
-        Position = UDim2.new(0, 14, 0, 178),
-        AutoButtonColor = false,
-        Parent = main,
-    }, { corner(10) })
-
-        --================ Baris tombol kecil ================
-    local row = new("Frame", {
-        Size = UDim2.new(1, -28, 0, 34),
-        Position = UDim2.new(0, 14, 0, 228),
-        BackgroundTransparency = 1,
-        Parent = main,
-    })
-
-    local function smallBtn(text, x, w, danger)
-        return new("TextButton", {
-            Text = text,
-            Font = Enum.Font.GothamMedium,
-            TextSize = 12,
-            TextColor3 = danger and C.danger or C.text,
-            BackgroundColor3 = C.panel2,
-            BorderSizePixel = 0,
-            Size = UDim2.new(w, -6, 1, 0),
-            Position = UDim2.new(x, 0, 0, 0),
-            AutoButtonColor = true,
-            Parent = row,
+            LayoutOrder = order,
+            Parent = list,
         }, { corner(8), stroke(C.stroke, 1) })
+
+        -- garis aksen kiri
+        new("Frame", {
+            Size = UDim2.new(0, 3, 1, -16),
+            Position = UDim2.new(0, 0, 0, 8),
+            BackgroundColor3 = C.accent,
+            BorderSizePixel = 0,
+            Parent = row,
+        }, { corner(2) })
+
+        new("TextLabel", {
+            Text = icon,
+            Font = Enum.Font.GothamBold, TextSize = 15,
+            TextColor3 = C.accent, BackgroundTransparency = 1,
+            Size = UDim2.new(0, 26, 0, 26),
+            Position = UDim2.new(0, 12, 0, 14),
+            Parent = row,
+        })
+
+        new("TextLabel", {
+            Text = name,
+            Font = Enum.Font.GothamBold, TextSize = 13,
+            TextColor3 = C.text, TextXAlignment = Enum.TextXAlignment.Left,
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, -100, 0, 16),
+            Position = UDim2.new(0, 44, 0, 10),
+            Parent = row,
+        })
+
+        new("TextLabel", {
+            Text = desc,
+            Font = Enum.Font.Gotham, TextSize = 10,
+            TextColor3 = C.textDim, TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, -110, 0, 24),
+            Position = UDim2.new(0, 44, 0, 26),
+            TextWrapped = true,
+            Parent = row,
+        })
+
+        return row
     end
 
-    local resetBtn = smallBtn("RESET STAT", 0,    0.5, false)
-    local hideBtn  = smallBtn("SEMBUNYIKAN", 0.5, 0.5, false)
+    -- -- Baris 1: Farm (tombol)
+    local rowFarm = makeRow(1, "▶", "Farm", "Jalankan / hentikan auto farm")
+    local farmBtn = new("TextButton", {
+        Text = "START", Font = Enum.Font.GothamBold, TextSize = 11,
+        TextColor3 = Color3.fromRGB(0, 0, 0),
+        BackgroundColor3 = C.accent, BorderSizePixel = 0,
+        Size = UDim2.new(0, 62, 0, 26),
+        Position = UDim2.new(1, -72, 0.5, -13),
+        AutoButtonColor = false, Parent = rowFarm,
+    }, { corner(6) })
 
-        --================ Log ================
-    new("TextLabel", {
-        Text = "LOG AKTIVITAS",
-        Font = Enum.Font.GothamBold,
-        TextSize = 10,
-        TextColor3 = C.textDim,
+    -- -- Baris 2: Auto DF (toggle)
+    local rowAuto = makeRow(2, "◈", "AutoDF", "Auto collect saat block di-break")
+    local autoToggle = makeToggle(rowAuto, 2)
+    autoToggle.holder = nil
+    -- pindahkan toggle ke kanan
+    for _, c in ipairs(rowAuto:GetChildren()) do
+        if c:IsA("TextButton") then
+            c.Position = UDim2.new(1, -58, 0.5, -12)
+        end
+    end
+
+    -- -- Baris 3: Break Kiri
+    local rowLeft = makeRow(3, "◀", "Break Kiri", "Sapu kolom kiri, dari atas ke bawah")
+    local leftToggle = makeToggle(rowLeft, 3)
+    for _, c in ipairs(rowLeft:GetChildren()) do
+        if c:IsA("TextButton") then c.Position = UDim2.new(1, -58, 0.5, -12) end
+    end
+
+    -- -- Baris 4: Break Kanan
+    local rowRight = makeRow(4, "▶", "Break Kanan", "Sapu kolom kanan, dari atas ke bawah")
+    local rightToggle = makeToggle(rowRight, 4)
+    for _, c in ipairs(rowRight:GetChildren()) do
+        if c:IsA("TextButton") then c.Position = UDim2.new(1, -58, 0.5, -12) end
+    end
+
+    -- -- Baris 5: Break 3 Arah
+    local row3 = makeRow(5, "≡", "Break 3 Arah", "Break baris + 2 lapis atas/bawah sekaligus")
+    local threeToggle = makeToggle(row3, 5)
+    for _, c in ipairs(row3:GetChildren()) do
+        if c:IsA("TextButton") then c.Position = UDim2.new(1, -58, 0.5, -12) end
+    end
+
+    -- -- Baris 6: Plant
+    local rowPlant = makeRow(6, "✚", "Plant", "Tanam ulang setelah break")
+    local plantToggle = makeToggle(rowPlant, 6)
+    for _, c in ipairs(rowPlant:GetChildren()) do
+        if c:IsA("TextButton") then c.Position = UDim2.new(1, -58, 0.5, -12) end
+    end
+
+    -- -- Baris 7: Auto Trash
+    local rowTrash = makeRow(7, "⌫", "Auto Trash", "Buang item sampah saat inventory penuh")
+    local trashToggle = makeToggle(rowTrash, 7)
+    for _, c in ipairs(rowTrash:GetChildren()) do
+        if c:IsA("TextButton") then c.Position = UDim2.new(1, -58, 0.5, -12) end
+    end
+
+    --================ STATISTIK ================
+    local statsBar = new("Frame", {
+        Size = UDim2.new(1, -20, 0, 34),
+        Position = UDim2.new(0, 10, 0, 376),
+        BackgroundColor3 = C.panel, BorderSizePixel = 0,
+        Parent = main,
+    }, { corner(8), stroke(C.stroke, 1) })
+
+    local statText = new("TextLabel", {
+        Text = "Block: 0   Item: 0   Target: -",
+        Font = Enum.Font.Code, TextSize = 11,
+        TextColor3 = C.textDim, BackgroundTransparency = 1,
+        Size = UDim2.new(1, -16, 1, 0),
+        Position = UDim2.new(0, 8, 0, 0),
         TextXAlignment = Enum.TextXAlignment.Left,
-        BackgroundTransparency = 1,
-        Size = UDim2.new(1, -28, 0, 16),
-        Position = UDim2.new(0, 16, 0, 272),
+        Parent = statsBar,
+    })
+
+    --================ STATUS FOOTER ================
+    local footer = new("TextLabel", {
+        Text = "Auto DF: Dihentikan.",
+        Font = Enum.Font.Gotham, TextSize = 11,
+        TextColor3 = C.textDim, BackgroundTransparency = 1,
+        Size = UDim2.new(1, -20, 0, 20),
+        Position = UDim2.new(0, 10, 0, 416),
+        TextXAlignment = Enum.TextXAlignment.Left,
         Parent = main,
     })
 
+    --================ LOG ================
     local logFrame = new("Frame", {
-        Size = UDim2.new(1, -28, 0, 92),
-        Position = UDim2.new(0, 14, 0, 290),
-        BackgroundColor3 = C.panel,
-        BorderSizePixel = 0,
+        Size = UDim2.new(1, -20, 0, 24),
+        Position = UDim2.new(0, 10, 0, 438),
+        BackgroundColor3 = C.panel, BorderSizePixel = 0,
         ClipsDescendants = true,
         Parent = main,
-    }, { corner(10), stroke(C.stroke, 1) })
+    }, { corner(6) })
 
-    local logLayout = new("UIListLayout", {
-        Padding = UDim.new(0, 3),
-        SortOrder = Enum.SortOrder.LayoutOrder,
+    local logText = new("TextLabel", {
+        Text = "siap.",
+        Font = Enum.Font.Code, TextSize = 10,
+        TextColor3 = C.textDim, BackgroundTransparency = 1,
+        Size = UDim2.new(1, -12, 1, 0),
+        Position = UDim2.new(0, 6, 0, 0),
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
         Parent = logFrame,
     })
-    new("UIPadding", {
-        PaddingTop = UDim.new(0, 6),
-        PaddingLeft = UDim.new(0, 8),
-        PaddingRight = UDim.new(0, 8),
-        Parent = logFrame,
-    })
 
-        --================ Tombol buka kembali ================
+    --================ TOMBOL BUKA KEMBALI ================
     local reopen = new("TextButton", {
-        Name = "Reopen",
-        Text = "GB",
-        Font = Enum.Font.GothamBold,
-        TextSize = 14,
-        TextColor3 = Color3.fromRGB(10, 14, 12),
-        BackgroundColor3 = C.accent,
-        BorderSizePixel = 0,
+        Text = "DF", Font = Enum.Font.GothamBold, TextSize = 13,
+        TextColor3 = Color3.fromRGB(0, 0, 0),
+        BackgroundColor3 = C.accent, BorderSizePixel = 0,
         Size = UDim2.new(0, 40, 0, 40),
-        Position = UDim2.new(0, 24, 0.5, -20),
-        Visible = false,
-        Parent = screen,
-    }, { corner(20), stroke(C.accentD, 2) })
+        Position = UDim2.new(0, 20, 0.5, -20),
+        Visible = false, Parent = screen,
+    }, { corner(20), stroke(C.accentDim, 2) })
     dragify(reopen, reopen)
 
-        --=====================================================================
-    -- FUNGSI UI
-        --=====================================================================
+    --=====================================================================
+    -- LOGIKA
+    --=====================================================================
+    -- pushLog: tulis ke label UI + teruskan ke callback eksternal kalau ada
     local function pushLog(msg)
-        local t = os.date("%H:%M:%S")
-        table.insert(STATE.logs, 1, ("[%s] %s"):format(t, msg))
-        while #STATE.logs > 7 do table.remove(STATE.logs) end
-        logFrame:ClearAllChildren()
-        logLayout.Parent = logFrame
-        new("UIPadding", {
-            PaddingTop = UDim.new(0, 6),
-            PaddingLeft = UDim.new(0, 8),
-            PaddingRight = UDim.new(0, 8),
-            Parent = logFrame,
-        })
-        for i, line in ipairs(STATE.logs) do
-            new("TextLabel", {
-                Text = line,
-                Font = Enum.Font.Code,
-                TextSize = 10,
-                TextColor3 = i == 1 and C.accent or C.textDim,
-                TextXAlignment = Enum.TextXAlignment.Left,
-                TextTruncate = Enum.TextTruncate.AtEnd,
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 12),
-                LayoutOrder = i,
-                Parent = logFrame,
-            })
+        logText.Text = tostring(msg)
+        -- externalLog dipasang oleh AutoFarm.lua kalau perlu; TIDAK boleh
+        -- menunjuk ke pushLog sendiri (itu bikin rekursi tak terbatas).
+        if STATE.externalLog then
+            pcall(STATE.externalLog, tostring(msg))
         end
     end
-
     STATE.log = pushLog
+    STATE.pushLog = pushLog
 
     local function refresh()
-        local s = API.status()
-        brokenVal.Text    = tostring(s.broken)
-        collectedVal.Text = tostring(s.collected)
-        targetVal.Text    = tostring(s.currentTarget == "-" and "-" or s.currentTarget)
-        targetVal.TextSize = 12
+        local s = API and API.status and API.status() or {}
+        local broken = s.broken or 0
+        local collected = s.collected or 0
+        local target = s.currentTarget or "-"
+        statText.Text = ("Block: %d   Item: %d   Target: %s"):format(broken, collected, tostring(target))
 
         if s.running then
-            statusLabel.Text = "● RUNNING"
-            statusLabel.TextColor3 = C.accent
-            actionBtn.Text = "STOP AUTO FARM"
-            actionBtn.BackgroundColor3 = C.danger
-            actionBtn.TextColor3 = Color3.fromRGB(255, 245, 245)
-            infoLabel.Text = "Sedang bekerja... target: " .. tostring(s.currentTarget)
+            farmBtn.Text = "STOP"
+            farmBtn.BackgroundColor3 = C.danger
+            footer.Text = "Auto DF: Berjalan... (" .. tostring(target) .. ")"
+            footer.TextColor3 = C.accent
         else
-            statusLabel.Text = "● IDLE"
-            statusLabel.TextColor3 = C.textDim
-            actionBtn.Text = "MULAI AUTO FARM"
-            actionBtn.BackgroundColor3 = C.accent
-            actionBtn.TextColor3 = Color3.fromRGB(10, 14, 12)
-            infoLabel.Text = "Siap. Tekan MULAI untuk memulai."
+            farmBtn.Text = "START"
+            farmBtn.BackgroundColor3 = C.accent
+            footer.Text = "Auto DF: Dihentikan."
+            footer.TextColor3 = C.textDim
+        end
+    end
+    STATE.refresh = refresh
+
+    --================ EVENT ================
+    farmBtn.MouseButton1Click:Connect(function()
+        if API and API.toggle then API.toggle() end
+        refresh()
+    end)
+
+    if autoToggle and autoToggle.set then
+        -- toggle auto collect: placeholder, dihubungkan ke API kalau ada
+        autoToggle.onChanged = function(v)
+            if API and API.setAutoCollect then API.setAutoCollect(v) end
+            pushLog("AutoDF: " .. (v and "aktif" or "mati"))
         end
     end
 
-    STATE.refresh = refresh
+    local function bindMode(toggle, key, label)
+        toggle.onChanged = function(v)
+            if API and API.setMode then API.setMode(key, v) end
+            pushLog(label .. ": " .. (v and "aktif" or "mati"))
+        end
+    end
+    bindMode(leftToggle, "sweepLeft", "Break Kiri")
+    bindMode(rightToggle, "sweepRight", "Break Kanan")
+    bindMode(threeToggle, "threeWay", "Break 3 Arah")
+    bindMode(plantToggle, "plant", "Plant")
+    bindMode(trashToggle, "autoTrash", "Auto Trash")
 
-        --=====================================================================
-    -- EVENT
-        --=====================================================================
-    actionBtn.MouseButton1Click:Connect(function()
-        API.toggle()
-        refresh()
-    end)
-
-    resetBtn.MouseButton1Click:Connect(function()
-        API.reset()
-        pushLog("Statistik direset")
-        refresh()
-    end)
-
-    hideBtn.MouseButton1Click:Connect(function()
-        main.Visible = false
-        reopen.Visible = true
+    closeBtn.MouseButton1Click:Connect(function()
+        if API and API.destroy then API.destroy() end
     end)
 
     reopen.MouseButton1Click:Connect(function()
@@ -847,18 +1186,21 @@ local function buildUI(api)
         reopen.Visible = false
     end)
 
-    closeBtn.MouseButton1Click:Connect(function()
-        API.destroy()
+    -- sembunyikan lewat klik kanan / tahan lama di header
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton2 then
+            main.Visible = false
+            reopen.Visible = true
+        end
     end)
 
     STATE.destroy = function()
         pcall(function() screen:Destroy() end)
     end
 
-    pushLog("UI dimuat. Menunggu perintah.")
+    pushLog("UI siap. Tekan START untuk mulai.")
     refresh()
 
-    -- sinkronkan tiap 400ms biar angka selalu segar
     task.spawn(function()
         while STATE.gui and STATE.gui.Parent do
             refresh()
@@ -869,16 +1211,17 @@ local function buildUI(api)
     return STATE
 end
 
-return UI
+return UI.build(api)
+
 end
 
--- panggil .build(API) -- UI.build mengembalikan tabel kontrol (refresh/log/destroy)
+-- panggil buildUI(API) -- mengembalikan tabel kontrol (refresh/log/destroy)
 local uiOk, uiErr = pcall(function()
-    local UImod = buildUI()
-    if type(UImod) ~= "table" or type(UImod.build) ~= "function" then
-        error("modul UI tidak valid")
+    local uiCtrl = buildUI(API)
+    if type(uiCtrl) ~= "table" then
+        error("UI tidak mengembalikan tabel kontrol")
     end
-    STATE.ui = UImod.build(API)
+    STATE.ui = uiCtrl
 end)
 
 if not uiOk then
