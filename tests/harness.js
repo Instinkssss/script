@@ -234,13 +234,13 @@ _G.__ITER = ITER
 local CLK = { t = 0 }
 os.clock = function() CLK.t = CLK.t + 0.15 return CLK.t end
 tick = function() return 0 end
-warn = function(...) end
+warn = function(...) local s="" for i=1,select("#",...) do s=s..tostring((select(i,...))).." " end io.write("[WARN] "..s, string.char(10)) end
 print = function(...) local s="" for i=1,select("#",...) do s=s..tostring((select(i,...))).." " end io.write(s .. [[
 
 ]]) end
 getgenv = function() return {} end
 loadstring = function() return function() return nil end end
-_G.RESULT = TRACE
+RESULT = TRACE
 _G.__BLOCKS = blocks
 `;
 
@@ -250,12 +250,16 @@ if (lauxlib.luaL_dostring(L, to_luastring(PRELUDE)) !== lua.LUA_OK) {
 }
 
 
-// --- load AutoFarm.lua, dengan bagian UI/loadstring-ui dan start dimatikan ---
+// --- load AutoFarm.lua. UI sekarang ter-embed, jadi biarkan dibangun sungguhan ---
 let src = fs.readFileSync(path.join(__dirname, '..', 'AutoFarm.lua'), 'utf8');
-// matikan pemuatan UI eksternal (HttpGet tidak ada di harness)
+// catat berapa Instance yang dibuat UI, supaya embed-nya bisa dibuktikan bekerja
 src = src.replace(
-  /local uiOk, UI = pcall\(function\(\)[\s\S]*?end\)\n/,
-  'local uiOk, UI = false, nil\n'
+  /^local Players\s+= game:GetService\("Players"\)/m,
+  `local __instCount = 0
+local __realInstanceNew = Instance.new
+Instance.new = function(cls) __instCount = __instCount + 1 return __realInstanceNew(cls) end
+__uiInstanceCount = function() return __instCount end
+local Players          = game:GetService("Players")`
 );
 // matikan expose getgenv
 src = src.replace(/getgenv\(\)\.GrowbloxAutoFarm = API/, 'G = API');
@@ -286,6 +290,7 @@ RESULT.idle = G.status().idleStrikes
 RESULT.invCount = 0
 RESULT.runningAtEnd = (G.status().running == true)
 RESULT.guard = guard
+RESULT.uiInstances = __uiInstanceCount()
 `;
 
 if (lauxlib.luaL_dostring(L, to_luastring(src)) !== lua.LUA_OK) {

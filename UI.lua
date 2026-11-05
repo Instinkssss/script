@@ -442,7 +442,7 @@ function UI.build(API)
         end
     end)
 
-    return UI
+    return STATE
 end
 
 return UI

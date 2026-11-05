@@ -18,24 +18,36 @@ Cara kerjanya:
 
 ## Cara Pakai
 
-### Langkah 1 — Discovery
+### Cara Tercepat (1 baris)
+
+`AutoFarm.lua` sudah **single-file** — UI ter-embed di dalamnya. Cukup satu loadstring, tidak perlu file lain:
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/USERNAME/REPO/main/AutoFarm.lua"))()
+```
+
+Ganti `USERNAME/REPO` sesuai repo Anda. Selesai.
+
+### Kalau auto-detect meleset
+
+**Langkah 1 — Discovery**
 
 1. Buka Growblox di Roblox.
-2. Buka Delta Executor, tempel isi `Discovery.lua`, execute.
-3. Buka tab **Console / Output** di Delta, copy semua hasilnya.
+2. Buka executor, tempel isi `Discovery.lua`, execute.
+3. Buka tab **Console / Output**, copy hasilnya.
 4. Cari baris `[RemoteEvent] ReplicatedStorage.XXX` — kandidat nama remote break-nya.
 
 Discovery juga menampilkan struktur `workspace` (bagian `[3]`), kandidat block beserta material dan atributnya (bagian `[4]`), dan daftar tool di Backpack (bagian `[5]`).
 
-### Langkah 2 — Konfigurasi
+**Langkah 2 — Konfigurasi**
 
-Edit bagian atas `AutoFarm.lua`:
+Kalau perlu, edit bagian atas `AutoFarm.lua` lalu upload ulang:
 
 ```lua
 REMOTES = {
     ["break"] = "NamaRemoteBreak",   -- dari hasil Discovery
     collect   = nil,                  -- isi kalau ada remote collect terpisah
-    hit       = nil,
+    hit       = nil,                  -- isi kalau break butuh multi-hit
 },
 ```
 
@@ -47,37 +59,23 @@ BLOCK_CONTAINERS = { "Blocks", "World" },
 
 ### Langkah 3 — Upload ke GitHub
 
-`AutoFarm.lua` memuat `UI.lua` dari internet, jadi keduanya harus ada di repo publik.
+`AutoFarm.lua` single-file, tapi `Discovery.lua` juga berguna di-upload.
 
 ```bash
 cd growblox-autofarm
 git init
-git add AutoFarm.lua UI.lua Discovery.lua README.md LICENSE .gitignore
+git add .
 git commit -m "Growblox auto farm"
 git branch -M main
 git remote add origin https://github.com/USERNAME/REPO.git
 git push -u origin main
 ```
 
-Setelah itu ganti URL di bagian bawah `AutoFarm.lua`:
-
-```lua
-local uiOk, UI = pcall(function()
-    return loadstring(game:HttpGet(
-        "https://raw.githubusercontent.com/USERNAME/REPO/main/UI.lua"
-    ))()
-end)
-```
-
-Ganti `USERNAME/REPO` sesuai punyamu, lalu commit dan push lagi.
-
-### Langkah 4 — Jalankan
+Ganti `USERNAME/REPO`, lalu di Roblox pakai:
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/USERNAME/REPO/main/AutoFarm.lua"))()
 ```
-
-`UI.lua` juga harus di-upload ke repo yang sama, karena `AutoFarm.lua` memuatnya dari `raw.githubusercontent.com`.
 
 ## Kontrol
 
@@ -123,7 +121,7 @@ Nama remote salah atau tidak ada sama sekali. Cek hasil Discovery bagian `[1]`, 
 `countInventory()` menghitung jumlah anak di Backpack + PlayerGui. Kalau Growblox pakai sistem inventory custom (item berupa nilai angka, bukan objek Instance), fungsi ini perlu diubah menyesuaikan game.
 
 **UI tidak muncul**
-Cek Console Delta. Kalau ada error `HttpGet` berarti URL `UI.lua` belum di-upload ke repo, atau `USERNAME/REPO` di `AutoFarm.lua` belum diganti. Script tetap jalan tanpa UI; cek pesan `warn` di console.
+Cek Console. Kalau ada `[WARN] [Growblox AutoFarm] UI gagal dibangun`, berarti ada error saat membangun UI — laporkan pesannya. Script tetap jalan tanpa UI.
 
 **Script jalan tapi tidak ada yang terjadi**
 Cek `getgenv().GrowbloxAutoFarm.status().lastError` untuk pesan terakhir.
@@ -132,8 +130,8 @@ Cek `getgenv().GrowbloxAutoFarm.status().lastError` untuk pesan terakhir.
 
 ```
 growblox-autofarm/
-├── AutoFarm.lua        -- script utama (loadstring target)
-├── UI.lua              -- modul UI, dimuat terpisah via HttpGet
+├── AutoFarm.lua        -- script utama, SINGLE-FILE (UI ter-embed)
+├── UI.lua              -- sumber UI terpisah (referensi; AutoFarm.lua tidak butuh ini)
 ├── Discovery.lua       -- tool recon, jalankan sekali untuk cari nama remote
 ├── README.md
 ├── LICENSE
